@@ -3,4 +3,5 @@
 /Makefile
 /bin
 /setup.sh
-/slack-queue-bot
+/slack-queue-bot.env
+data/queue.db*
