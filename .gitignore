@@ -5,3 +5,4 @@
 /setup.sh
 /slack-queue-bot.env
 data/queue.db*
+.env
