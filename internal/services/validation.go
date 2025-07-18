@@ -41,11 +41,21 @@ func (v *ValidationService) ValidateQueueSize(currentSize int) error {
 	return nil
 }
 
-// ValidateUserInQueue checks if a user is already in the queue
+// ValidateUserInQueue checks if a user is already in the queue for any environment/tag
 func (v *ValidationService) ValidateUserInQueue(userID string, queue []models.QueueItem) error {
 	for _, item := range queue {
 		if item.UserID == userID {
-			return fmt.Errorf("already in queue")
+			return fmt.Errorf("already in queue for %s/%s", item.Environment, item.Tag)
+		}
+	}
+	return nil
+}
+
+// ValidateUserInQueueForTag checks if a user is already in queue for a specific environment/tag
+func (v *ValidationService) ValidateUserInQueueForTag(userID, environment, tag string, queue []models.QueueItem) error {
+	for _, item := range queue {
+		if item.UserID == userID && item.Environment == environment && item.Tag == tag {
+			return fmt.Errorf("already in queue for %s/%s", environment, tag)
 		}
 	}
 	return nil
@@ -159,7 +169,7 @@ func (v *ValidationService) ValidateCommand(cmd *models.CommandRequest) error {
 			return fmt.Errorf("tag is required for %s command", cmd.Command)
 		}
 
-	case "leave", "position", "status", "list", "assign":
+	case "leave", "position", "status", "list", "assign", "help", "cleanup", "clear", "admin":
 		// These commands don't require additional validation
 
 	default:

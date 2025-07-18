@@ -15,6 +15,12 @@ type QueueService interface {
 	GetQueueStatus() *models.QueueStatus
 	ProcessQueue() error
 	IsQueueEmpty(environment, tag string) bool
+	ReleaseUserTags(userID string) ([]string, error)
+	ReleaseUserTagsBulk(userID string) ([]string, error)
+	ReleaseSpecificTag(userID, environment, tagName string) error
+	SetSuppressIndividualNotifications(suppress bool)
+	ClearQueue() (int, error)                       // Admin: Clear all queue positions
+	ReleaseAllAssignedTags() (int, []string, error) // Admin: Release all assigned tags
 }
 
 // TagService defines the interface for tag management operations
@@ -35,6 +41,8 @@ type NotificationService interface {
 	NotifyUser(userID, message string) error
 	NotifyUserBlock(userID, emoji, summary, detail, suggestion string) error
 	BroadcastQueueUpdate() error
+	BroadcastOrUpdateQueueStatus() error // New method for updating previous status messages
+	UpdateExistingQueueStatus() error    // Silent update method that only updates existing messages
 	CreateQueueStatusBlocks() ([]slack.Block, error)
 	NotifyAssignment(userID string, tag *models.Tag, environment string) error
 	NotifyExpiration(userID string, tag *models.Tag, environment string) error
@@ -45,6 +53,8 @@ type NotificationService interface {
 	CreatePositionInfo(userPos *models.UserPosition, availableTags int) string
 	CreateEnvironmentList(environments map[string]*models.Environment) string
 	SetQueueService(queueService QueueService)
+	CreateQueueStatusBlocksForUser(userID string) ([]slack.Block, error)
+	TrackStatusMessage(timestamp string) // Manually track a status message for future updates
 }
 
 // ConfigService defines the interface for configuration management
@@ -55,6 +65,12 @@ type ConfigService interface {
 	ValidateEnvironment(environment string) error
 	ValidateTag(environment, tag string) error
 	GetConfigSummary() map[string]interface{}
+
+	// Admin management
+	IsAdmin(userID string) bool
+	AddAdmin(userID string) error
+	RemoveAdmin(userID string) error
+	GetAdmins() []string
 }
 
 // PersistenceService defines the interface for data persistence
@@ -99,6 +115,7 @@ type ValidationService interface {
 	ValidateTagAvailability(environment, tag string, environments map[string]*models.Environment) error
 	ValidateUserAssignment(userID, environment, tag string, environments map[string]*models.Environment) error
 	ValidateCommand(cmd *models.CommandRequest) error
+	ValidateUserInQueueForTag(userID, environment, tag string, queue []models.QueueItem) error
 }
 
 // DatabaseRepository defines the interface for database operations
@@ -111,6 +128,8 @@ type DatabaseRepository interface {
 	UpdateTagStatus(environment, tag, status string, assignedTo *string, expiresAt *time.Time) error
 	GetTag(environment, tag string) (*models.Tag, error)
 	GetAvailableTags(environment string) ([]*models.Tag, error)
+	GetTagsByEnvironment(envName string) ([]*models.Tag, error)
+	ReleaseAllTags() (int, []string, error) // Returns count and list of released tags
 
 	// Queue operations
 	JoinQueue(userID, username, environment, tag string, durationMinutes int) error
@@ -118,6 +137,7 @@ type DatabaseRepository interface {
 	GetQueue() ([]models.QueueItem, error)
 	GetUserPosition(userID string) (int, *models.QueueItem, error)
 	IsQueueEmpty(environment, tag string) (bool, error)
+	ClearQueue() (int, error) // Returns number of users cleared
 
 	// TTL operations
 	GetExpiredEvents() ([]models.Tag, error)

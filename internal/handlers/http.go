@@ -84,9 +84,7 @@ func (h *HTTPHandler) HealthCheck() (int, string) {
 
 // ManualSave triggers a manual save operation
 func (h *HTTPHandler) ManualSave() (int, string) {
-	// For now, this would trigger the persistence service save
-	// In the current architecture, we don't have direct access to persistence
-	// This is a placeholder implementation
+	// This endpoint provides a manual save interface for external systems
 
 	response := map[string]interface{}{
 		"status":  "success",

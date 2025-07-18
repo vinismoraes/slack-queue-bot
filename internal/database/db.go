@@ -170,59 +170,9 @@ func (db *DB) initSchema() error {
 		DELETE FROM expiration_events WHERE tag_id = OLD.id;
 	END;
 
-		-- AUTO-EXPIRATION TRIGGER: Check and release expired tags on any UPDATE operation
-	CREATE TRIGGER IF NOT EXISTS trigger_auto_expire_on_update
-		BEFORE UPDATE ON tags
-	BEGIN
-		-- First, handle any expired tags in the system before processing the current update
-		UPDATE tags
-		SET status = 'available', assigned_to = NULL, assigned_at = NULL, expires_at = NULL
-		WHERE status = 'occupied'
-			AND expires_at IS NOT NULL
-			AND expires_at < datetime('now')
-			AND id != NEW.id; -- Don't interfere with the current update
-
-		-- Log auto-expirations for expired tags (excluding the current update)
-		INSERT INTO auto_expiration_log (tag_id, environment, tag_name, assigned_to)
-		SELECT t.id, e.name, t.name, t.assigned_to
-		FROM tags t
-		JOIN environments e ON t.environment_id = e.id
-		WHERE t.status = 'occupied'
-			AND t.expires_at IS NOT NULL
-			AND t.expires_at < datetime('now')
-			AND t.id != NEW.id;
-
-		-- Mark expiration events as processed for expired tags
-		UPDATE expiration_events
-		SET processed = TRUE
-		WHERE expires_at < datetime('now') AND processed = FALSE;
-	END;
-
-	-- AUTO-EXPIRATION TRIGGER: Check expired tags on queue operations
-	CREATE TRIGGER IF NOT EXISTS trigger_auto_expire_on_queue_change
-		BEFORE INSERT ON queue
-	BEGIN
-		-- Check and release any expired tags before adding to queue
-		UPDATE tags
-		SET status = 'available', assigned_to = NULL, assigned_at = NULL, expires_at = NULL
-		WHERE status = 'occupied'
-			AND expires_at IS NOT NULL
-			AND expires_at < datetime('now');
-
-		-- Log auto-expirations
-		INSERT INTO auto_expiration_log (tag_id, environment, tag_name, assigned_to)
-		SELECT t.id, e.name, t.name, t.assigned_to
-		FROM tags t
-		JOIN environments e ON t.environment_id = e.id
-		WHERE t.status = 'occupied'
-			AND t.expires_at IS NOT NULL
-			AND t.expires_at < datetime('now');
-
-		-- Mark expiration events as processed
-		UPDATE expiration_events
-		SET processed = TRUE
-		WHERE expires_at < datetime('now') AND processed = FALSE;
-	END;
+		-- AUTO-EXPIRATION TRIGGERS DISABLED - These were causing issues with tag assignments
+	-- The triggers were interfering with the assignment process by releasing expired tags
+	-- during UPDATE operations, which was causing assignments to be lost
 
 	-- Insert default configuration settings if they don't exist
 	INSERT OR IGNORE INTO config_settings (setting_key, setting_value, setting_type, description) VALUES
@@ -235,7 +185,8 @@ func (db *DB) initSchema() error {
 		('auto_save_interval', '10m', 'duration', 'How often to auto-save data'),
 		('slack_channel_id', '', 'string', 'Default Slack channel for notifications'),
 		('slack_bot_token', '', 'string', 'Slack bot token'),
-		('enable_notifications', 'true', 'string', 'Whether to send notifications');
+		('enable_notifications', 'true', 'string', 'Whether to send notifications'),
+		('admin_users', '[]', 'string', 'JSON array of Slack user IDs with admin privileges');
 	`
 
 	_, err := db.conn.Exec(schema)
@@ -269,8 +220,9 @@ type Tag struct {
 
 // Environment represents a test environment
 type Environment struct {
-	ID        int       `json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	Tags      []Tag     `json:"tags"`
+	ID          int       `json:"id"`
+	Name        string    `json:"name"`
+	DisplayName string    `json:"display_name"`
+	CreatedAt   time.Time `json:"created_at"`
+	Tags        []Tag     `json:"tags"`
 }

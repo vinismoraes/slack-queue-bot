@@ -3,6 +3,7 @@ package services
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"slack-queue-bot/internal/interfaces"
@@ -14,22 +15,27 @@ import (
 
 // NotificationService handles all Slack messaging operations
 type NotificationService struct {
-	slackClient  *slack.Client
-	channelID    string
-	queueService interfaces.QueueService
-	config       *models.ConfigSettings
+	slackClient       *slack.Client
+	channelID         string
+	queueService      interfaces.QueueService
+	configService     interfaces.ConfigService
+	config            *models.ConfigSettings
+	lastStatusMessage string    // Track last status message timestamp for updates
+	lastStatusTime    time.Time // Track when last status was sent
 }
 
 // NewNotificationService creates a new notification service
 func NewNotificationService(
 	slackClient *slack.Client,
 	channelID string,
+	configService interfaces.ConfigService,
 	config *models.ConfigSettings,
 ) interfaces.NotificationService {
 	return &NotificationService{
-		slackClient: slackClient,
-		channelID:   channelID,
-		config:      config,
+		slackClient:   slackClient,
+		channelID:     channelID,
+		configService: configService,
+		config:        config,
 	}
 }
 
@@ -93,6 +99,93 @@ func (ns *NotificationService) BroadcastQueueUpdate() error {
 	return nil
 }
 
+// BroadcastOrUpdateQueueStatus updates the previous status message if it exists and is recent, otherwise posts a new one
+func (ns *NotificationService) BroadcastOrUpdateQueueStatus() error {
+	log.Printf("NotificationService.BroadcastOrUpdateQueueStatus")
+
+	if ns.queueService == nil {
+		return fmt.Errorf("queue service not set")
+	}
+
+	status := ns.queueService.GetQueueStatus()
+	blocks := ns.createQueueStatusBlocks(status)
+
+	// Check if we have a recent status message to update (within last 5 minutes)
+	if ns.lastStatusMessage != "" && time.Since(ns.lastStatusTime) < 5*time.Minute {
+		log.Printf("Attempting to update previous status message: %s", ns.lastStatusMessage)
+
+		// Try to update the existing message
+		_, _, _, err := ns.slackClient.UpdateMessage(ns.channelID, ns.lastStatusMessage, slack.MsgOptionBlocks(blocks...))
+		if err != nil {
+			log.Printf("Failed to update previous message (will post new one): %v", err)
+			log.Printf("Error details: %T - %s", err, err.Error())
+			// Fall back to posting new message
+			return ns.postNewStatusMessage(blocks)
+		}
+
+		log.Printf("Successfully updated existing status message")
+		// Update timestamp but keep same message ID
+		ns.lastStatusTime = time.Now()
+		return nil
+	}
+
+	// Post new message
+	return ns.postNewStatusMessage(blocks)
+}
+
+// UpdateExistingQueueStatus updates only the existing status message, doesn't post new ones
+// This is used for silent operations like tag releases that shouldn't spam the channel
+func (ns *NotificationService) UpdateExistingQueueStatus() error {
+	log.Printf("NotificationService.UpdateExistingQueueStatus")
+
+	if ns.queueService == nil {
+		return fmt.Errorf("queue service not set")
+	}
+
+	// Only update if we have a recent status message (within last 10 minutes)
+	if ns.lastStatusMessage == "" || time.Since(ns.lastStatusTime) > 10*time.Minute {
+		log.Printf("No recent status message to update (last: %v ago), skipping silent update", time.Since(ns.lastStatusTime))
+		return nil
+	}
+
+	status := ns.queueService.GetQueueStatus()
+	blocks := ns.createQueueStatusBlocks(status)
+
+	// Try to update the existing message
+	_, _, _, err := ns.slackClient.UpdateMessage(ns.channelID, ns.lastStatusMessage, slack.MsgOptionBlocks(blocks...))
+	if err != nil {
+		log.Printf("Failed to update existing status message: %v", err)
+		return err
+	}
+
+	log.Printf("Successfully updated existing status message silently")
+	// Update timestamp but keep same message ID
+	ns.lastStatusTime = time.Now()
+	return nil
+}
+
+// postNewStatusMessage posts a new status message and tracks it
+func (ns *NotificationService) postNewStatusMessage(blocks []slack.Block) error {
+	_, timestamp, err := ns.slackClient.PostMessage(ns.channelID, slack.MsgOptionBlocks(blocks...))
+	if err != nil {
+		return fmt.Errorf("failed to post new status message: %w", err)
+	}
+
+	// Track the new message for future updates
+	ns.lastStatusMessage = timestamp
+	ns.lastStatusTime = time.Now()
+	log.Printf("Posted new status message: %s", timestamp)
+
+	return nil
+}
+
+// TrackStatusMessage manually tracks a status message for future updates
+func (ns *NotificationService) TrackStatusMessage(timestamp string) {
+	ns.lastStatusMessage = timestamp
+	ns.lastStatusTime = time.Now()
+	log.Printf("Tracking status message for updates: %s", timestamp)
+}
+
 // CreateQueueStatusBlocks creates and returns status blocks without sending them
 // This allows for ephemeral responses or custom message handling
 func (ns *NotificationService) CreateQueueStatusBlocks() ([]slack.Block, error) {
@@ -108,128 +201,91 @@ func (ns *NotificationService) CreateQueueStatusBlocks() ([]slack.Block, error) 
 	return blocks, nil
 }
 
+// CreateQueueStatusBlocksForUser creates and returns status blocks for a specific user
+// This allows for user-specific button visibility (ephemeral responses)
+func (ns *NotificationService) CreateQueueStatusBlocksForUser(userID string) ([]slack.Block, error) {
+	log.Printf("NotificationService.CreateQueueStatusBlocksForUser: userID=%s", userID)
+
+	if ns.queueService == nil {
+		return nil, fmt.Errorf("queue service not set")
+	}
+
+	status := ns.queueService.GetQueueStatus()
+	blocks := ns.createQueueStatusBlocksForUser(status, userID)
+
+	return blocks, nil
+}
+
 // NotifyAssignment notifies a user of tag assignment
 func (ns *NotificationService) NotifyAssignment(userID string, tag *models.Tag, environment string) error {
 	log.Printf("NotificationService.NotifyAssignment: userID=%s, tag=%s/%s", userID, environment, tag.Name)
 
 	expiryTime := tag.ExpiresAt.Format("15:04")
-	duration := tag.ExpiresAt.Sub(tag.AssignedAt)
-	durationText := utils.FormatDuration(duration)
 
-	message := fmt.Sprintf("🎉 *Tag Assigned!*\n"+
-		"You've been assigned to tag: *%s* in environment: *%s*\n"+
-		"⏰ This assignment expires at *%s* (%s from now)",
-		tag.Name, environment, expiryTime, durationText)
-
-	// Send DM to user
-	err := ns.NotifyUser(userID, message)
-	if err != nil {
-		log.Printf("Warning: Failed to send assignment DM to user %s: %v", userID, err)
-	}
-
-	// Send channel notification
+	// Send only channel notification - no DM to user
 	channelMessage := fmt.Sprintf("🎉 <@%s> has been assigned to *%s/%s* (expires at %s)",
 		userID, environment, tag.Name, expiryTime)
 
-	_, _, err = ns.slackClient.PostMessage(ns.channelID, slack.MsgOptionText(channelMessage, false))
+	_, _, err := ns.slackClient.PostMessage(ns.channelID, slack.MsgOptionText(channelMessage, false))
 	if err != nil {
 		log.Printf("Warning: Failed to send assignment channel message: %v", err)
 	}
 
-	return nil
+	return err
 }
 
 // NotifyExpiration notifies about tag expiration
 func (ns *NotificationService) NotifyExpiration(userID string, tag *models.Tag, environment string) error {
 	log.Printf("NotificationService.NotifyExpiration: userID=%s, tag=%s/%s", userID, environment, tag.Name)
 
-	// Send DM to user
-	message := fmt.Sprintf("⏰ *Assignment Expired*\n"+
-		"Your assignment to tag *%s* in environment *%s* has expired and has been released.",
-		tag.Name, environment)
-
-	err := ns.NotifyUser(userID, message)
-	if err != nil {
-		log.Printf("Warning: Failed to send expiration DM to user %s: %v", userID, err)
-	}
-
-	// Send channel notification
+	// Send only channel notification - no DM to user
 	channelMessage := fmt.Sprintf("⏰ <@%s>'s assignment to *%s/%s* has expired and been released",
 		userID, environment, tag.Name)
 
-	_, _, err = ns.slackClient.PostMessage(ns.channelID, slack.MsgOptionText(channelMessage, false))
+	_, _, err := ns.slackClient.PostMessage(ns.channelID, slack.MsgOptionText(channelMessage, false))
 	if err != nil {
 		log.Printf("Warning: Failed to send expiration channel message: %v", err)
 	}
 
-	return nil
+	return err
 }
 
 // NotifyQueueJoined notifies a user they've joined the queue
 func (ns *NotificationService) NotifyQueueJoined(userID string, position int) error {
 	log.Printf("NotificationService.NotifyQueueJoined: userID=%s, position=%d", userID, position)
 
-	var message string
-	if position == 1 {
-		message = "✅ *Added to Queue!*\n🎯 You're next in line! You'll be assigned as soon as a tag becomes available."
-	} else {
-		estimatedWaitMinutes := (position - 1) * 30
-		estimatedWait := time.Duration(estimatedWaitMinutes) * time.Minute
-		message = fmt.Sprintf("✅ *Added to Queue!*\n"+
-			"📋 You are position *%d* in the queue\n"+
-			"⏱️ Estimated wait time: *%s*",
-			position, utils.FormatDuration(estimatedWait))
-	}
-
-	return ns.NotifyUser(userID, message)
+	// No longer send DM notifications for queue joins - only channel notifications are sent from main.go
+	return nil
 }
 
 // NotifyQueueLeft notifies a user they've left the queue
 func (ns *NotificationService) NotifyQueueLeft(userID string) error {
 	log.Printf("NotificationService.NotifyQueueLeft: userID=%s", userID)
 
-	message := "👋 *Left Queue*\nYou have been removed from the queue."
-
-	// Send DM to user
-	err := ns.NotifyUser(userID, message)
-	if err != nil {
-		log.Printf("Warning: Failed to send queue left DM to user %s: %v", userID, err)
-	}
-
-	// Send channel notification
+	// Send only channel notification - no DM to user
 	channelMessage := fmt.Sprintf("👋 <@%s> has left the queue", userID)
 
-	_, _, err = ns.slackClient.PostMessage(ns.channelID, slack.MsgOptionText(channelMessage, false))
+	_, _, err := ns.slackClient.PostMessage(ns.channelID, slack.MsgOptionText(channelMessage, false))
 	if err != nil {
 		log.Printf("Warning: Failed to send queue left channel message: %v", err)
 	}
 
-	return nil
+	return err
 }
 
 // NotifyTagRelease notifies about manual tag release
 func (ns *NotificationService) NotifyTagRelease(userID string, environment, tag string) error {
 	log.Printf("NotificationService.NotifyTagRelease: userID=%s, tag=%s/%s", userID, environment, tag)
 
-	// Send DM to user
-	message := fmt.Sprintf("✅ *Tag Released*\n"+
-		"You have successfully released tag *%s* in environment *%s*.",
-		tag, environment)
-
-	err := ns.NotifyUser(userID, message)
-	if err != nil {
-		log.Printf("Warning: Failed to send release DM to user %s: %v", userID, err)
-	}
-
-	// Send channel notification
+	// Send only channel notification - no DM to user
 	channelMessage := fmt.Sprintf("✅ <@%s> has released *%s/%s*", userID, environment, tag)
 
-	_, _, err = ns.slackClient.PostMessage(ns.channelID, slack.MsgOptionText(channelMessage, false))
+	_, _, err := ns.slackClient.PostMessage(ns.channelID, slack.MsgOptionText(channelMessage, false))
 	if err != nil {
 		log.Printf("Warning: Failed to send release channel message: %v", err)
 	}
 
-	return nil
+	return err
 }
 
 // NotifyAssignmentExtended notifies about assignment extension
@@ -239,16 +295,25 @@ func (ns *NotificationService) NotifyAssignmentExtended(userID string, tag *mode
 	newExpiryTime := tag.ExpiresAt.Format("15:04")
 	extensionText := utils.FormatDuration(extension)
 
-	message := fmt.Sprintf("⏰ *Assignment Extended*\n"+
-		"Your assignment to tag *%s* in environment *%s* has been extended by *%s*.\n"+
-		"New expiration time: *%s*",
-		tag.Name, environment, extensionText, newExpiryTime)
+	// Send only channel notification - no DM to user
+	channelMessage := fmt.Sprintf("⏰ <@%s> extended assignment to *%s/%s* by *%s* (expires at %s)",
+		userID, environment, tag.Name, extensionText, newExpiryTime)
 
-	return ns.NotifyUser(userID, message)
+	_, _, err := ns.slackClient.PostMessage(ns.channelID, slack.MsgOptionText(channelMessage, false))
+	if err != nil {
+		log.Printf("Warning: Failed to send extension channel message: %v", err)
+	}
+
+	return err
 }
 
 // createQueueStatusBlocks creates Slack blocks for queue status display
 func (ns *NotificationService) createQueueStatusBlocks(status *models.QueueStatus) []slack.Block {
+	return ns.createQueueStatusBlocksForUser(status, "")
+}
+
+// createQueueStatusBlocksForUser creates Slack blocks for queue status display with user-specific buttons
+func (ns *NotificationService) createQueueStatusBlocksForUser(status *models.QueueStatus, userID string) []slack.Block {
 	blocks := []slack.Block{}
 
 	// Show warning if queue is full or nearly full
@@ -290,7 +355,7 @@ func (ns *NotificationService) createQueueStatusBlocks(status *models.QueueStatu
 		}
 	}
 
-	summaryText := fmt.Sprintf("🟢 *%d* available • 🔴 *%d* occupied • 👥 *%d* in queue",
+	summaryText := fmt.Sprintf("🟢 *%d* available • 🔵 *%d* in use • 👥 *%d* in queue",
 		totalAvailable, totalOccupied, status.TotalUsers)
 
 	blocks = append(blocks, slack.NewSectionBlock(
@@ -298,102 +363,335 @@ func (ns *NotificationService) createQueueStatusBlocks(status *models.QueueStatu
 		nil, nil,
 	))
 
-	// Occupied tags section - only show if there are occupied tags
-	if totalOccupied > 0 {
-		blocks = append(blocks, slack.NewDividerBlock())
+	// === CURRENT USER SECTION (if userID provided) ===
+	if userID != "" {
+		var userAssignments []*models.Tag
+		var userQueueItems []models.QueueItem
+		var otherUserAssignments []*models.Tag
+		var otherQueueItems []models.QueueItem
 
-		occupiedText := "*🔴 Occupied Tags:*\n"
-
-		for envName, env := range status.Environments {
-			envHasOccupied := false
-			var envOccupiedTags []string
-
+		// Separate current user's data from others
+		for _, env := range status.Environments {
 			for _, tag := range env.Tags {
 				if tag.Status == "occupied" {
-					envHasOccupied = true
-					tagInfo := fmt.Sprintf("• `%s`", tag.Name)
-
-					if tag.AssignedTo != "" {
-						tagInfo += fmt.Sprintf(" - <@%s>", tag.AssignedTo)
+					if tag.AssignedTo == userID {
+						userAssignments = append(userAssignments, tag)
+					} else {
+						otherUserAssignments = append(otherUserAssignments, tag)
 					}
+				}
+			}
+		}
 
-					if !tag.ExpiresAt.IsZero() {
-						timeLeft := tag.ExpiresAt.Sub(time.Now())
-						if timeLeft > 0 {
-							tagInfo += fmt.Sprintf(" (expires in %s)", utils.FormatDuration(timeLeft))
-						} else {
-							tagInfo += " (expired)"
+		for _, queueItem := range status.Queue {
+			if queueItem.UserID == userID {
+				userQueueItems = append(userQueueItems, queueItem)
+			} else {
+				otherQueueItems = append(otherQueueItems, queueItem)
+			}
+		}
+
+		// Show current user's assignments first
+		if len(userAssignments) > 0 {
+			blocks = append(blocks, slack.NewDividerBlock())
+
+			adminIndicator := ""
+			if ns.configService != nil && ns.configService.IsAdmin(userID) {
+				adminIndicator = " 👑"
+			}
+
+			assignmentText := fmt.Sprintf("*🎉 Your Active Assignments:%s*\n", adminIndicator)
+			for _, tag := range userAssignments {
+				timeLeft := ""
+				if !tag.ExpiresAt.IsZero() {
+					remaining := tag.ExpiresAt.Sub(time.Now())
+					if remaining > 0 {
+						timeLeft = fmt.Sprintf("\n   ⏰ expires in %s", utils.FormatDuration(remaining))
+					} else {
+						timeLeft = "\n   ⚠️ expired"
+					}
+				}
+				assignmentText += fmt.Sprintf("• `%s/%s`%s\n", tag.Environment, tag.Name, timeLeft)
+			}
+
+			blocks = append(blocks, slack.NewSectionBlock(
+				slack.NewTextBlockObject("mrkdwn", assignmentText, false, false),
+				nil, nil,
+			))
+		}
+
+		// Show current user's queue positions
+		if len(userQueueItems) > 0 {
+			if len(userAssignments) == 0 {
+				blocks = append(blocks, slack.NewDividerBlock())
+			}
+
+			adminIndicator := ""
+			if ns.configService != nil && ns.configService.IsAdmin(userID) {
+				adminIndicator = " 👑"
+			}
+
+			queueText := fmt.Sprintf("*⏳ Your Queue Positions:%s*\n", adminIndicator)
+			for _, item := range userQueueItems {
+				// Find position in the overall queue for this environment/tag
+				position := 1
+				for _, otherItem := range status.Queue {
+					if otherItem.Environment == item.Environment && otherItem.Tag == item.Tag {
+						if otherItem.UserID == userID {
+							break
 						}
+						position++
 					}
+				}
 
-					envOccupiedTags = append(envOccupiedTags, tagInfo)
+				queueText += fmt.Sprintf("• *Position %d* for %s/%s (duration: %s)\n",
+					position, item.Environment, item.Tag, utils.FormatDuration(item.Duration))
+			}
+
+			blocks = append(blocks, slack.NewSectionBlock(
+				slack.NewTextBlockObject("mrkdwn", queueText, false, false),
+				nil, nil,
+			))
+		}
+
+		// === OTHER USERS SUMMARY SECTION ===
+		if len(otherUserAssignments) > 0 || len(otherQueueItems) > 0 {
+			blocks = append(blocks, slack.NewDividerBlock())
+
+			othersText := "*👥 Other Activity:*\n"
+
+			// Group other assignments by environment
+			envAssignments := make(map[string][]string)
+			for _, tag := range otherUserAssignments {
+				timeLeft := ""
+				if !tag.ExpiresAt.IsZero() {
+					remaining := tag.ExpiresAt.Sub(time.Now())
+					if remaining > 0 {
+						timeLeft = fmt.Sprintf(" (expires in %s)", utils.FormatDuration(remaining))
+					} else {
+						timeLeft = " (expired)"
+					}
+				}
+				assignment := fmt.Sprintf("%s%s by <@%s>", tag.Name, timeLeft, tag.AssignedTo)
+				envAssignments[tag.Environment] = append(envAssignments[tag.Environment], assignment)
+			}
+
+			// Show environment summaries
+			for envName, assignments := range envAssignments {
+				if len(assignments) <= 3 {
+					othersText += fmt.Sprintf("• *%s:* %s\n", envName, strings.Join(assignments, ", "))
+				} else {
+					othersText += fmt.Sprintf("• *%s:* %s and %d more\n",
+						envName, strings.Join(assignments[:3], ", "), len(assignments)-3)
 				}
 			}
 
-			if envHasOccupied {
-				occupiedText += fmt.Sprintf("*%s:*\n", envName)
-				for _, tagInfo := range envOccupiedTags {
-					occupiedText += tagInfo + "\n"
+			// Show queue summary with user information
+			if len(otherQueueItems) > 0 {
+				// Group by environment/tag and show users
+				queueGroups := make(map[string][]string)
+				for _, item := range otherQueueItems {
+					key := fmt.Sprintf("%s/%s", item.Environment, item.Tag)
+					userInfo := fmt.Sprintf("<@%s>", item.UserID)
+					queueGroups[key] = append(queueGroups[key], userInfo)
 				}
-				occupiedText += "\n"
+
+				var queueEntries []string
+				for key, users := range queueGroups {
+					if len(users) == 1 {
+						queueEntries = append(queueEntries, fmt.Sprintf("%s by %s", key, users[0]))
+					} else {
+						queueEntries = append(queueEntries, fmt.Sprintf("%s by %s (%d waiting)", key, users[0], len(users)))
+					}
+				}
+
+				if len(queueEntries) > 0 {
+					if len(envAssignments) > 0 {
+						othersText += "\n"
+					}
+					othersText += fmt.Sprintf("• *Queue:* %s\n", strings.Join(queueEntries, ", "))
+				}
 			}
+
+			blocks = append(blocks, slack.NewSectionBlock(
+				slack.NewTextBlockObject("mrkdwn", othersText, false, false),
+				nil, nil,
+			))
 		}
+	} else {
+		// === GENERAL BROADCAST (no specific user) ===
+		// Show a more compact view for general broadcasts
+		if totalOccupied > 0 {
+			blocks = append(blocks, slack.NewDividerBlock())
 
-		blocks = append(blocks, slack.NewSectionBlock(
-			slack.NewTextBlockObject("mrkdwn", occupiedText, false, false),
-			nil, nil,
-		))
-	}
+			// Group occupied tags by environment and user with better formatting
+			envUserOccupied := make(map[string]map[string][]string)
+			for _, env := range status.Environments {
+				for _, tag := range env.Tags {
+					if tag.Status == "occupied" {
+						if envUserOccupied[env.Name] == nil {
+							envUserOccupied[env.Name] = make(map[string][]string)
+						}
 
-	// Queue section - only show if there are users waiting
-	if len(status.Queue) > 0 {
-		blocks = append(blocks, slack.NewDividerBlock())
+						timeLeft := ""
+						if !tag.ExpiresAt.IsZero() {
+							remaining := tag.ExpiresAt.Sub(time.Now())
+							if remaining > 0 {
+								timeLeft = fmt.Sprintf(" ⏰ %s", utils.FormatDuration(remaining))
+							} else {
+								timeLeft = " ⚠️ expired"
+							}
+						}
 
-		queueText := "*👥 Queue:*\n"
-		// Show only first 3 users
-		displayCount := len(status.Queue)
-		if displayCount > 3 {
-			displayCount = 3
-		}
-
-		for i := 0; i < displayCount; i++ {
-			item := status.Queue[i]
-			position := i + 1
-			queueText += fmt.Sprintf("%d. <@%s>", position, item.UserID)
-			if item.Environment != "" && item.Tag != "" {
-				queueText += fmt.Sprintf(" (waiting for %s/%s)", item.Environment, item.Tag)
-			} else if item.Environment != "" {
-				queueText += fmt.Sprintf(" (waiting for %s)", item.Environment)
+						tagInfo := fmt.Sprintf("`%s`%s", tag.Name, timeLeft)
+						envUserOccupied[env.Name][tag.AssignedTo] = append(envUserOccupied[env.Name][tag.AssignedTo], tagInfo)
+					}
+				}
 			}
-			queueText += "\n"
+
+			occupiedText := "*🔵 Tags In Use:*\n"
+			for envName, userTags := range envUserOccupied {
+				occupiedText += fmt.Sprintf("• *%s:*\n", envName)
+				for userID, tags := range userTags {
+					if len(tags) == 1 {
+						occupiedText += fmt.Sprintf("  <@%s>: %s\n", userID, tags[0])
+					} else {
+						occupiedText += fmt.Sprintf("  <@%s>: %s\n", userID, strings.Join(tags, ", "))
+					}
+				}
+			}
+
+			blocks = append(blocks, slack.NewSectionBlock(
+				slack.NewTextBlockObject("mrkdwn", occupiedText, false, false),
+				nil, nil,
+			))
 		}
 
-		if len(status.Queue) > 3 {
-			queueText += fmt.Sprintf("... and %d more", len(status.Queue)-3)
-		}
+		// Show queue summary with user information
+		if len(status.Queue) > 0 {
+			if totalOccupied > 0 {
+				blocks = append(blocks, slack.NewDividerBlock())
+			}
 
-		blocks = append(blocks, slack.NewSectionBlock(
-			slack.NewTextBlockObject("mrkdwn", queueText, false, false),
-			nil, nil,
-		))
+			queueText := "*👥 Queue:*\n"
+			// Group by environment/tag and show users
+			queueGroups := make(map[string][]string)
+			for _, item := range status.Queue {
+				key := fmt.Sprintf("%s/%s", item.Environment, item.Tag)
+				userInfo := fmt.Sprintf("<@%s>", item.UserID)
+				queueGroups[key] = append(queueGroups[key], userInfo)
+			}
+
+			var queueEntries []string
+			for key, users := range queueGroups {
+				if len(users) == 1 {
+					queueEntries = append(queueEntries, fmt.Sprintf("%s by %s", key, users[0]))
+				} else {
+					queueEntries = append(queueEntries, fmt.Sprintf("%s by %s (%d waiting)", key, users[0], len(users)))
+				}
+			}
+
+			queueText += fmt.Sprintf("• %s\n", strings.Join(queueEntries, ", "))
+
+			blocks = append(blocks, slack.NewSectionBlock(
+				slack.NewTextBlockObject("mrkdwn", queueText, false, false),
+				nil, nil,
+			))
+		}
 	}
 
 	// Add divider before buttons
 	blocks = append(blocks, slack.NewDividerBlock())
 
-	// Interactive Buttons
+	// Interactive Buttons - contextual based on user status
+	var actionElements []slack.BlockElement
+
+	// Always show Join Queue button
 	joinButton := slack.NewButtonBlockElement("join_queue", "join_queue",
 		slack.NewTextBlockObject("plain_text", "🎯 Join Queue", true, false))
 	joinButton.Style = "primary"
+	actionElements = append(actionElements, joinButton)
 
-	leaveButton := slack.NewButtonBlockElement("leave_queue", "leave_queue",
-		slack.NewTextBlockObject("plain_text", "🚪 Leave Queue", true, false))
+	// Show admin-only buttons if user is admin
+	isUserAdmin := false
+	if userID != "" && ns.configService != nil {
+		isUserAdmin = ns.configService.IsAdmin(userID)
+	}
 
-	statusButton := slack.NewButtonBlockElement("check_position", "check_position",
-		slack.NewTextBlockObject("plain_text", "📍 My Position", true, false))
+	// Determine user status for contextual buttons
+	userInQueue := false
+	userHasAssignments := false
+	userAssignmentCount := 0
+	userQueueCount := 0
 
-	actionBlock := slack.NewActionBlock("queue_actions", joinButton, leaveButton, statusButton)
-	blocks = append(blocks, actionBlock)
+	if userID != "" {
+		// Check user's assignments and queue positions from the status
+		for _, env := range status.Environments {
+			for _, tag := range env.Tags {
+				if tag.Status == "occupied" {
+					if tag.AssignedTo == userID {
+						userHasAssignments = true
+						userAssignmentCount++
+					}
+				}
+			}
+		}
+
+		for _, queueItem := range status.Queue {
+			if queueItem.UserID == userID {
+				userInQueue = true
+				userQueueCount++
+			}
+		}
+	}
+
+	// Show contextual buttons based on user state
+
+	if userHasAssignments {
+		// User has assignments - show Release button(s)
+		releaseText := "🔓 Release Tags"
+		if userAssignmentCount == 1 {
+			releaseText = "🔓 Release Tag"
+		} else {
+			releaseText = "🔓 Release All Tags"
+		}
+		releaseButton := slack.NewButtonBlockElement("release_tags", "release_tags",
+			slack.NewTextBlockObject("plain_text", releaseText, true, false))
+		releaseButton.Style = "danger"
+		actionElements = append(actionElements, releaseButton)
+	}
+
+	if userInQueue {
+		// User is in queue - show Leave button(s)
+		leaveText := "🚪 Leave Queue"
+		if userQueueCount > 1 {
+			leaveText = "🚪 Leave All Queues"
+		}
+		leaveButton := slack.NewButtonBlockElement("leave_queue", "leave_queue",
+			slack.NewTextBlockObject("plain_text", leaveText, true, false))
+		leaveButton.Style = "danger"
+		actionElements = append(actionElements, leaveButton)
+	}
+
+	// Add action buttons
+	if len(actionElements) > 0 {
+		blocks = append(blocks, slack.NewActionBlock("", actionElements...))
+	}
+
+	// Add admin-only actions if user is admin
+	if isUserAdmin {
+		adminElements := []slack.BlockElement{
+			slack.NewButtonBlockElement("assign_next", "assign_next",
+				slack.NewTextBlockObject("plain_text", "⚡ Assign Next", true, false)),
+		}
+
+		adminActionBlock := slack.NewActionBlock("admin_actions", adminElements...)
+		blocks = append(blocks, adminActionBlock)
+
+		// Add admin indicator context
+		blocks = append(blocks, slack.NewContextBlock("",
+			slack.NewTextBlockObject("mrkdwn", "👑 _Admin controls visible_", false, false)))
+	}
 
 	return blocks
 }
@@ -434,7 +732,7 @@ func (ns *NotificationService) CreateEnvironmentList(environments map[string]*mo
 
 			switch tag.Status {
 			case "occupied":
-				status = "🔴"
+				status = "🔵"
 			case "maintenance":
 				status = "🟡"
 			}
@@ -442,13 +740,13 @@ func (ns *NotificationService) CreateEnvironmentList(environments map[string]*mo
 			result += fmt.Sprintf("  %s `%s` (%s)", status, tagName, statusText)
 
 			if tag.AssignedTo != "" {
-				result += fmt.Sprintf(" - <@%s>", tag.AssignedTo)
+				result += fmt.Sprintf(" → <@%s>", tag.AssignedTo)
 				if !tag.ExpiresAt.IsZero() {
 					timeLeft := tag.ExpiresAt.Sub(time.Now())
 					if timeLeft > 0 {
-						result += fmt.Sprintf(" (expires in %s)", utils.FormatDuration(timeLeft))
+						result += fmt.Sprintf("\n     ⏰ expires in %s", utils.FormatDuration(timeLeft))
 					} else {
-						result += " (expired)"
+						result += "\n     ⚠️ expired"
 					}
 				}
 			}
@@ -462,18 +760,31 @@ func (ns *NotificationService) CreateEnvironmentList(environments map[string]*mo
 
 // CreatePositionInfo creates formatted position information for a user
 func (ns *NotificationService) CreatePositionInfo(userPos *models.UserPosition, availableTags int) string {
-	if userPos.Position == -1 {
-		// User has an active assignment
-		if userPos.ActiveAssignment != nil {
-			timeLeft := userPos.ActiveAssignment.ExpiresAt.Sub(time.Now())
-			if timeLeft > 0 {
-				return fmt.Sprintf("🎉 You have an active assignment to *%s* in *%s* (expires in %s)",
-					userPos.ActiveAssignment.Name, userPos.ActiveAssignment.Environment, utils.FormatDuration(timeLeft))
+	if userPos.Position == -1 || len(userPos.ActiveAssignments) > 0 {
+		// User has active assignments
+		if len(userPos.ActiveAssignments) > 0 {
+			var assignmentTexts []string
+			for _, assignment := range userPos.ActiveAssignments {
+				timeLeft := assignment.ExpiresAt.Sub(time.Now())
+				if timeLeft > 0 {
+					assignmentText := fmt.Sprintf("*%s* in *%s* (expires in %s)",
+						assignment.Name, assignment.Environment, utils.FormatDuration(timeLeft))
+					assignmentTexts = append(assignmentTexts, assignmentText)
+				} else {
+					assignmentText := fmt.Sprintf("*%s* in *%s* (expired)",
+						assignment.Name, assignment.Environment)
+					assignmentTexts = append(assignmentTexts, assignmentText)
+				}
+			}
+
+			if len(assignmentTexts) == 1 {
+				return fmt.Sprintf("🎉 You have an active assignment to %s", assignmentTexts[0])
 			} else {
-				return "⚠️ Your assignment has expired and will be released soon"
+				return fmt.Sprintf("🎉 You have %d active assignments:\n• %s",
+					len(assignmentTexts), strings.Join(assignmentTexts, "\n• "))
 			}
 		}
-		return "🎉 You have an active assignment"
+		return "🎉 You have active assignments"
 	}
 
 	if userPos.Position == 0 {

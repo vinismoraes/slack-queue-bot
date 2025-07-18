@@ -47,7 +47,7 @@ func (ts *TagService) AssignTag(userID string, environment, tag string, duration
 	}
 
 	// Calculate expiration time
-	expiresAt := time.Now().Add(duration)
+	expiresAt := time.Now().UTC().Add(duration)
 
 	// Update tag status in database
 	err = ts.db.UpdateTagStatus(environment, tag, "occupied", &userID, &expiresAt)
@@ -60,7 +60,7 @@ func (ts *TagService) AssignTag(userID string, environment, tag string, duration
 		Name:        tag,
 		Status:      "occupied",
 		AssignedTo:  userID,
-		AssignedAt:  time.Now(),
+		AssignedAt:  time.Now().UTC(),
 		ExpiresAt:   expiresAt,
 		Environment: environment,
 	}, nil
@@ -87,8 +87,7 @@ func (ts *TagService) ReleaseTag(userID, environment, tag string) error {
 	}
 
 	// Notify about release
-	ts.notification.NotifyTagRelease(userID, tag, environment)
-	ts.notification.BroadcastQueueUpdate()
+	ts.notification.NotifyTagRelease(userID, environment, tag)
 
 	log.Printf("Tag %s/%s released by user %s", environment, tag, userID)
 	return nil
@@ -120,7 +119,6 @@ func (ts *TagService) ExtendAssignment(userID, environment, tag string, extensio
 	// Get updated tag for notification
 	updatedTag, _ := ts.db.GetTag(environment, tag)
 	ts.notification.NotifyAssignmentExtended(userID, updatedTag, environment, extension)
-	ts.notification.BroadcastQueueUpdate()
 
 	log.Printf("Tag %s/%s assignment extended for user %s until %s", environment, tag, userID, newExpiresAt.Format("15:04"))
 	return nil
@@ -189,8 +187,6 @@ func (ts *TagService) UpdateTagStatus(environment, tag, status string) error {
 		// For occupied status, additional info should be provided via AssignTag
 		return fmt.Errorf("use AssignTag method to set occupied status")
 	}
-
-	ts.notification.BroadcastQueueUpdate()
 
 	log.Printf("Tag %s/%s status updated to %s", environment, tag, status)
 	return nil

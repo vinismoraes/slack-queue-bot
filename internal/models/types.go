@@ -52,8 +52,9 @@ type Tag struct {
 
 // Environment represents a test environment containing multiple tags
 type Environment struct {
-	Name string          `json:"name"`
-	Tags map[string]*Tag `json:"tags"`
+	Name        string          `json:"name"`
+	DisplayName string          `json:"display_name"`
+	Tags        map[string]*Tag `json:"tags"`
 }
 
 // QueueItem represents a user in the queue for a specific tag
@@ -83,8 +84,9 @@ type Config struct {
 
 // ConfigEnvironment represents environment configuration
 type ConfigEnvironment struct {
-	Name string   `json:"name"`
-	Tags []string `json:"tags"`
+	Name        string   `json:"name"`
+	DisplayName string   `json:"display_name"`
+	Tags        []string `json:"tags"`
 }
 
 // ConfigSettings represents application settings
@@ -96,6 +98,7 @@ type ConfigSettings struct {
 	ExtensionTime    Duration `json:"extension_time"`
 	ExpirationCheck  Duration `json:"expiration_check"`
 	AutoSaveInterval Duration `json:"auto_save_interval"`
+	AdminUsers       []string `json:"admin_users,omitempty"` // Slack user IDs with admin privileges
 }
 
 // QueueStatus represents the current status of the queue and environments
@@ -109,10 +112,11 @@ type QueueStatus struct {
 
 // UserPosition represents a user's position information in the queue
 type UserPosition struct {
-	Position         int           `json:"position"`          // 0 = not in queue, -1 = has assignment
-	QueueItem        *QueueItem    `json:"queue_item"`        // nil if not in queue
-	EstimatedWait    time.Duration `json:"estimated_wait"`    // estimated wait time
-	ActiveAssignment *Tag          `json:"active_assignment"` // nil if no assignment
+	Position          int           `json:"position"`           // 0 = not in queue, -1 = has assignment
+	QueueItem         *QueueItem    `json:"queue_item"`         // nil if not in queue
+	EstimatedWait     time.Duration `json:"estimated_wait"`     // estimated wait time
+	ActiveAssignment  *Tag          `json:"active_assignment"`  // nil if no assignment (deprecated, use ActiveAssignments)
+	ActiveAssignments []*Tag        `json:"active_assignments"` // all user assignments
 }
 
 // NotificationMessage represents a notification to be sent

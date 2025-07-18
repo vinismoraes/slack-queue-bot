@@ -65,12 +65,13 @@ func (r *Repository) GetEnvironments() (map[string]*models.Environment, error) {
 		}
 
 		modelEnv := &models.Environment{
-			Name: env.Name,
-			Tags: make(map[string]*models.Tag),
+			Name:        env.Name,
+			DisplayName: env.DisplayName,
+			Tags:        make(map[string]*models.Tag),
 		}
 
 		for _, tag := range tags {
-			modelTag := convertDBTagToModel(tag, env.Name)
+			modelTag := convertDBTagToModel(*tag, env.Name)
 			modelEnv.Tags[tag.Name] = modelTag
 		}
 
@@ -96,7 +97,7 @@ func (r *Repository) GetTag(environment, tagName string) (*models.Tag, error) {
 
 	for _, tag := range tags {
 		if tag.Name == tagName {
-			return convertDBTagToModel(tag, environment), nil
+			return convertDBTagToModel(*tag, environment), nil
 		}
 	}
 
@@ -113,7 +114,7 @@ func (r *Repository) GetAvailableTags(environment string) ([]*models.Tag, error)
 	var availableTags []*models.Tag
 	for _, tag := range tags {
 		if tag.Status == "available" {
-			modelTag := convertDBTagToModel(tag, environment)
+			modelTag := convertDBTagToModel(*tag, environment)
 			availableTags = append(availableTags, modelTag)
 		}
 	}
@@ -184,6 +185,26 @@ func (r *Repository) IsQueueEmpty(environment, tag string) (bool, error) {
 	return r.db.IsQueueEmptyForTag(environment, tag)
 }
 
+// ClearQueue removes all users from the queue
+func (r *Repository) ClearQueue() (int, error) {
+	return r.db.ClearQueue()
+}
+
+// ReleaseAllTags releases all currently assigned tags
+func (r *Repository) ReleaseAllTags() (int, []string, error) {
+	count, dbTags, err := r.db.ReleaseAllTags()
+	if err != nil {
+		return 0, nil, err
+	}
+
+	var tagNames []string
+	for _, tag := range dbTags {
+		tagNames = append(tagNames, fmt.Sprintf("%s/%s", tag.Environment, tag.Name))
+	}
+
+	return count, tagNames, nil
+}
+
 // TTL operations
 
 // GetExpiredEvents returns expired tag assignments
@@ -224,7 +245,7 @@ func (r *Repository) GetUpcomingExpirations(window time.Duration) ([]models.Tag,
 
 		for _, tag := range envTags {
 			if tag.Name == event.TagName && tag.Status == "occupied" {
-				modelTag := convertDBTagToModel(tag, event.Environment)
+				modelTag := convertDBTagToModel(*tag, event.Environment)
 				tags = append(tags, *modelTag)
 				break
 			}
@@ -305,4 +326,17 @@ func (r *Repository) TriggerDatabaseAutoExpirationWithNotifications(notification
 // Close closes the database connection
 func (r *Repository) Close() error {
 	return r.db.Close()
+}
+
+// GetTagsByEnvironment returns all tags for a specific environment as model pointers
+func (r *Repository) GetTagsByEnvironment(envName string) ([]*models.Tag, error) {
+	dbTags, err := r.db.GetTagsByEnvironment(envName)
+	if err != nil {
+		return nil, err
+	}
+	var tags []*models.Tag
+	for _, dbTag := range dbTags {
+		tags = append(tags, convertDBTagToModel(*dbTag, envName))
+	}
+	return tags, nil
 }

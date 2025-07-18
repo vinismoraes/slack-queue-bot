@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -11,14 +12,24 @@ import (
 
 // CreateEnvironment creates a new environment with its tags
 func (db *DB) CreateEnvironment(name string, tags []string) error {
+	return db.CreateEnvironmentWithDisplayName(name, "", tags)
+}
+
+// CreateEnvironmentWithDisplayName creates a new environment with its tags and optional display name
+func (db *DB) CreateEnvironmentWithDisplayName(name, displayName string, tags []string) error {
 	tx, err := db.conn.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
+	// If no display name provided, generate one from name
+	if displayName == "" {
+		displayName = generateDisplayName(name)
+	}
+
 	// Insert environment
-	result, err := tx.Exec("INSERT INTO environments (name) VALUES (?)", name)
+	result, err := tx.Exec("INSERT INTO environments (name, display_name) VALUES (?, ?)", name, displayName)
 	if err != nil {
 		return fmt.Errorf("failed to insert environment: %w", err)
 	}
@@ -39,10 +50,21 @@ func (db *DB) CreateEnvironment(name string, tags []string) error {
 	return tx.Commit()
 }
 
+// generateDisplayName creates a display name from an environment name
+func generateDisplayName(name string) string {
+	// Replace dashes with spaces and title case
+	displayName := strings.ReplaceAll(name, "-", " ")
+	words := strings.Fields(displayName)
+	for i, word := range words {
+		words[i] = strings.Title(strings.ToLower(word))
+	}
+	return strings.Join(words, " ")
+}
+
 // GetEnvironments returns all environments with their tags
 func (db *DB) GetEnvironments() ([]Environment, error) {
 	// Get environments
-	rows, err := db.conn.Query("SELECT id, name, created_at FROM environments ORDER BY name")
+	rows, err := db.conn.Query("SELECT id, name, display_name, created_at FROM environments ORDER BY name")
 	if err != nil {
 		return nil, fmt.Errorf("failed to query environments: %w", err)
 	}
@@ -51,8 +73,16 @@ func (db *DB) GetEnvironments() ([]Environment, error) {
 	var environments []Environment
 	for rows.Next() {
 		var env Environment
-		if err := rows.Scan(&env.ID, &env.Name, &env.CreatedAt); err != nil {
+		var displayName sql.NullString
+		if err := rows.Scan(&env.ID, &env.Name, &displayName, &env.CreatedAt); err != nil {
 			return nil, fmt.Errorf("failed to scan environment: %w", err)
+		}
+
+		// Handle nullable display_name
+		if displayName.Valid {
+			env.DisplayName = displayName.String
+		} else {
+			env.DisplayName = generateDisplayName(env.Name)
 		}
 
 		// Get tags for this environment
@@ -95,7 +125,7 @@ func (db *DB) getTagsForEnvironment(envID int, envName string) ([]Tag, error) {
 }
 
 // GetTagsByEnvironment gets all tags for a specific environment by name
-func (db *DB) GetTagsByEnvironment(envName string) ([]Tag, error) {
+func (db *DB) GetTagsByEnvironment(envName string) ([]*Tag, error) {
 	// First get the environment ID
 	var envID int
 	err := db.conn.QueryRow("SELECT id FROM environments WHERE name = ?", envName).Scan(&envID)
@@ -103,7 +133,28 @@ func (db *DB) GetTagsByEnvironment(envName string) ([]Tag, error) {
 		return nil, fmt.Errorf("environment not found: %w", err)
 	}
 
-	return db.getTagsForEnvironment(envID, envName)
+	rows, err := db.conn.Query(`
+		SELECT id, name, environment_id, status, assigned_to, assigned_at, expires_at, created_at
+		FROM tags
+		WHERE environment_id = ?
+		ORDER BY name`, envID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query tags: %w", err)
+	}
+	defer rows.Close()
+
+	var tags []*Tag
+	for rows.Next() {
+		var tag Tag
+		if err := rows.Scan(&tag.ID, &tag.Name, &tag.EnvironmentID, &tag.Status,
+			&tag.AssignedTo, &tag.AssignedAt, &tag.ExpiresAt, &tag.CreatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan tag: %w", err)
+		}
+		tag.Environment = envName
+		tags = append(tags, &tag)
+	}
+
+	return tags, nil
 }
 
 // Queue Operations
@@ -116,14 +167,14 @@ func (db *DB) JoinQueue(userID, username, environment, tag string, durationMinut
 	}
 	defer tx.Rollback()
 
-	// Check if user is already in queue
+	// Check if user is already in queue for this specific environment+tag
 	var count int
-	err = tx.QueryRow("SELECT COUNT(*) FROM queue WHERE user_id = ?", userID).Scan(&count)
+	err = tx.QueryRow("SELECT COUNT(*) FROM queue WHERE user_id = ? AND environment = ? AND tag = ?", userID, environment, tag).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("failed to check if user in queue: %w", err)
 	}
 	if count > 0 {
-		return fmt.Errorf("user is already in queue")
+		return fmt.Errorf("user is already in queue for %s/%s", environment, tag)
 	}
 
 	// Get next position in queue
@@ -176,6 +227,34 @@ func (db *DB) LeaveQueue(userID string) error {
 	}
 
 	return tx.Commit()
+}
+
+// ClearQueue removes all users from the queue atomically
+func (db *DB) ClearQueue() (int, error) {
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Count current queue size
+	var count int
+	err = tx.QueryRow("SELECT COUNT(*) FROM queue").Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count queue: %w", err)
+	}
+
+	if count == 0 {
+		return 0, nil // Nothing to clear
+	}
+
+	// Clear all queue entries
+	_, err = tx.Exec("DELETE FROM queue")
+	if err != nil {
+		return 0, fmt.Errorf("failed to clear queue: %w", err)
+	}
+
+	return count, tx.Commit()
 }
 
 // GetQueue returns all users in the queue ordered by position
@@ -244,7 +323,7 @@ func (db *DB) UpdateTagStatus(environment, tagName, status string, assignedTo *s
 
 	var assignedAt *time.Time
 	if assignedTo != nil {
-		now := time.Now()
+		now := time.Now().UTC()
 		assignedAt = &now
 	}
 
@@ -312,6 +391,88 @@ func (db *DB) GetExpiredTags() ([]Tag, error) {
 	}
 
 	return tags, nil
+}
+
+// GetOccupiedTags returns all currently assigned/occupied tags
+func (db *DB) GetOccupiedTags() ([]Tag, error) {
+	rows, err := db.conn.Query(`
+		SELECT t.id, t.name, t.environment_id, e.name as environment, t.status,
+		       t.assigned_to, t.assigned_at, t.expires_at, t.created_at
+		FROM tags t
+		JOIN environments e ON t.environment_id = e.id
+		WHERE t.status = 'occupied'
+		ORDER BY e.name, t.name`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query occupied tags: %w", err)
+	}
+	defer rows.Close()
+
+	var tags []Tag
+	for rows.Next() {
+		var tag Tag
+		if err := rows.Scan(&tag.ID, &tag.Name, &tag.EnvironmentID, &tag.Environment,
+			&tag.Status, &tag.AssignedTo, &tag.AssignedAt, &tag.ExpiresAt, &tag.CreatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan tag: %w", err)
+		}
+		tags = append(tags, tag)
+	}
+
+	return tags, nil
+}
+
+// ReleaseAllTags releases all currently assigned tags atomically
+func (db *DB) ReleaseAllTags() (int, []Tag, error) {
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Get all occupied tags first for the return value
+	rows, err := tx.Query(`
+		SELECT t.id, t.name, t.environment_id, e.name as environment, t.status,
+		       t.assigned_to, t.assigned_at, t.expires_at, t.created_at
+		FROM tags t
+		JOIN environments e ON t.environment_id = e.id
+		WHERE t.status = 'occupied'`)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to query occupied tags: %w", err)
+	}
+
+	var releasedTags []Tag
+	for rows.Next() {
+		var tag Tag
+		if err := rows.Scan(&tag.ID, &tag.Name, &tag.EnvironmentID, &tag.Environment,
+			&tag.Status, &tag.AssignedTo, &tag.AssignedAt, &tag.ExpiresAt, &tag.CreatedAt); err != nil {
+			return 0, nil, fmt.Errorf("failed to scan tag: %w", err)
+		}
+		releasedTags = append(releasedTags, tag)
+	}
+	rows.Close()
+
+	if len(releasedTags) == 0 {
+		return 0, nil, nil // Nothing to release
+	}
+
+	// Release all occupied tags
+	_, err = tx.Exec(`
+		UPDATE tags
+		SET status = 'available', assigned_to = NULL, assigned_at = NULL, expires_at = NULL
+		WHERE status = 'occupied'`)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to release all tags: %w", err)
+	}
+
+	// Mark all related expiration events as processed
+	_, err = tx.Exec(`
+		UPDATE expiration_events
+		SET processed = TRUE
+		WHERE processed = FALSE`)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to mark expiration events as processed: %w", err)
+	}
+
+	return len(releasedTags), releasedTags, tx.Commit()
 }
 
 // HasUserActiveAssignment checks if user has any active tag assignments
@@ -861,7 +1022,7 @@ func (db *DB) DeleteConfigSetting(key string) error {
 // MigrateConfigFromJSON migrates configuration from JSON to database
 func (db *DB) MigrateConfigFromJSON(jsonPath string) error {
 	// This will be implemented to read from the existing config.json and populate the database
-	// For now, the default settings are already inserted during schema initialization
+	// Default settings are inserted during schema initialization
 	log.Printf("Configuration migration would read from %s and populate database", jsonPath)
 	return nil
 }

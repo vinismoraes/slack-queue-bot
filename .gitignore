@@ -6,3 +6,4 @@
 /slack-queue-bot.env
 data/queue.db*
 .env
+data/queue_bot.db

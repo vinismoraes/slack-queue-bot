@@ -134,8 +134,9 @@ func (cm *Manager) Load() error {
 		}
 
 		configEnvironments = append(configEnvironments, models.ConfigEnvironment{
-			Name: env.Name,
-			Tags: tagNames,
+			Name:        env.Name,
+			DisplayName: env.DisplayName,
+			Tags:        tagNames,
 		})
 	}
 
@@ -249,6 +250,15 @@ func (cm *Manager) parseSettings(dbSettings map[string]database.ConfigSetting) (
 				return nil, fmt.Errorf("invalid auto_save_interval value: %s", setting.SettingValue)
 			}
 			settings.AutoSaveInterval = models.Duration(duration)
+
+		case "admin_users":
+			var adminUsers []string
+			if setting.SettingValue != "" && setting.SettingValue != "[]" {
+				if err := json.Unmarshal([]byte(setting.SettingValue), &adminUsers); err != nil {
+					return nil, fmt.Errorf("invalid admin_users value: %s", setting.SettingValue)
+				}
+			}
+			settings.AdminUsers = adminUsers
 		}
 	}
 
@@ -386,5 +396,86 @@ func (cm *Manager) MigrateFromJSON(configPath string) error {
 	}
 
 	fmt.Printf("Successfully migrated configuration from %s to database\n", configPath)
+	return nil
+}
+
+// IsAdmin checks if a user ID has admin privileges
+func (cm *Manager) IsAdmin(userID string) bool {
+	if cm.config == nil {
+		return false
+	}
+
+	for _, adminID := range cm.config.Settings.AdminUsers {
+		if adminID == userID {
+			return true
+		}
+	}
+	return false
+}
+
+// AddAdmin adds a user to the admin list
+func (cm *Manager) AddAdmin(userID string) error {
+	if cm.config == nil {
+		return fmt.Errorf("configuration not loaded")
+	}
+
+	// Check if already admin
+	if cm.IsAdmin(userID) {
+		return fmt.Errorf("user %s is already an admin", userID)
+	}
+
+	// Add to admin list
+	cm.config.Settings.AdminUsers = append(cm.config.Settings.AdminUsers, userID)
+
+	// Save to database
+	return cm.saveAdminUsers()
+}
+
+// RemoveAdmin removes a user from the admin list
+func (cm *Manager) RemoveAdmin(userID string) error {
+	if cm.config == nil {
+		return fmt.Errorf("configuration not loaded")
+	}
+
+	// Find and remove admin
+	for i, adminID := range cm.config.Settings.AdminUsers {
+		if adminID == userID {
+			// Remove from slice
+			cm.config.Settings.AdminUsers = append(cm.config.Settings.AdminUsers[:i], cm.config.Settings.AdminUsers[i+1:]...)
+
+			// Save to database
+			return cm.saveAdminUsers()
+		}
+	}
+
+	return fmt.Errorf("user %s is not an admin", userID)
+}
+
+// GetAdmins returns the list of admin user IDs
+func (cm *Manager) GetAdmins() []string {
+	if cm.config == nil {
+		return []string{}
+	}
+	return cm.config.Settings.AdminUsers
+}
+
+// saveAdminUsers saves the admin users list to the database
+func (cm *Manager) saveAdminUsers() error {
+	if cm.db == nil {
+		return fmt.Errorf("database not available")
+	}
+
+	// Convert admin list to JSON
+	adminJSON, err := json.Marshal(cm.config.Settings.AdminUsers)
+	if err != nil {
+		return fmt.Errorf("failed to marshal admin users: %w", err)
+	}
+
+	// Update in database using SetConfigSetting
+	err = cm.db.SetConfigSetting("admin_users", string(adminJSON), "string", "JSON array of Slack user IDs with admin privileges")
+	if err != nil {
+		return fmt.Errorf("failed to save admin users to database: %w", err)
+	}
+
 	return nil
 }
